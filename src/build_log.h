@@ -15,6 +15,7 @@
 #ifndef NINJA_BUILD_LOG_H_
 #define NINJA_BUILD_LOG_H_
 
+#include <list>
 #include <map>
 #include <string>
 #include <stdio.h>
@@ -68,20 +69,49 @@ struct BuildLog {
   /// Lookup a previously-run command by its output path.
   LogEntry* LookupByOutput(const string& path);
 
-  /// Serialize an entry into a log file.
-  void WriteEntry(FILE* f, const LogEntry& entry);
-
-  /// Rewrite the known log entries, throwing away old data.
-  bool Recompact(const string& path, string* err);
 
   typedef ExternalStringHashMap<LogEntry*>::Type Log;
   const Log& log() const { return log_; }
 
  private:
+  struct PendingLogDrop {
+    Log log_entries_to_save;
+    int log_file_number;
+  };
+
+  enum AppendOrTruncateEnum {
+    WRITELOG_APPEND,
+    WRITELOG_TRUNCATE,
+  };
+
+  /// Drop any log files that are not being heavily used.
+  bool DropLogs(const string& path, string* err);
+
+  /// Rotate the log files, moving .ninja_log to .ninja_log.1,
+  /// .ninja_log.1 to .ninja_log.2 etc...
+  bool Rotate(const string& path, string* err);
+
+  /// Rewrite the known log entries, throwing away old data.
+  bool Recompact(const string& path, string* err);
+
+  /// Serialize an entry into a log file.
+  static void WriteEntry(FILE* f, const LogEntry& entry);
+
+  /// Write a logfile from |log| to |path|, either truncating or appending based
+  /// on |append_or_truncate|. If there is an error, return it in |err|.
+  static bool WriteLog(Log* log, const string& path, string* err,
+                       AppendOrTruncateEnum append_or_truncate);
+  
+  string base_path_;
   Log log_;
   FILE* log_file_;
   BuildConfig* config_;
+
+  list<PendingLogDrop> pending_log_drops_;
+  bool needs_rotation_;
   bool needs_recompaction_;
+
+  int max_log_file_number_;
 };
 
 #endif // NINJA_BUILD_LOG_H_

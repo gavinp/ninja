@@ -15,8 +15,10 @@
 #include "build_log.h"
 
 #include <errno.h>
+#include <iostream>
 #include <stdlib.h>
 #include <string.h>
+#include <sstream>
 
 #ifndef _WIN32
 #define __STDC_FORMAT_MACROS
@@ -30,7 +32,7 @@
 #include "util.h"
 
 // Implementation details:
-// Each run's log appends to the log file.
+// Each run's log appends to the most recent log file.
 // To load, we run through all log entries in series, throwing away
 // older runs.
 // Once the number of redundant entries exceeds a threshold, we write
@@ -84,6 +86,12 @@ uint64_t MurmurHash64A(const void* key, int len) {
 #undef BIG_CONSTANT
 
 
+string ActualLogPath(const string& path, int number) {
+  ostringstream actual_path_stream;
+  actual_path_stream << path << "." << number;
+  return number == 0 ? path : actual_path_stream.str();
+}
+
 }  // namespace
 
 // static
@@ -92,7 +100,8 @@ uint64_t BuildLog::LogEntry::HashCommand(StringPiece command) {
 }
 
 BuildLog::BuildLog()
-  : log_file_(NULL), config_(NULL), needs_recompaction_(false) {}
+    : log_file_(NULL), config_(NULL), needs_rotation_(false), 
+      needs_recompaction_(false) {}
 
 BuildLog::~BuildLog() {
   Close();
@@ -106,6 +115,20 @@ bool BuildLog::OpenForWrite(const string& path, string* err) {
     Close();
     if (!Recompact(path, err))
       return false;
+    max_log_file_number_ = 0;
+    if (!Rotate(path, err))
+      return false;
+  }
+  else {
+    if (!pending_log_drops_.empty()) {
+      if (!DropLogs(path, err))
+        return false;
+    }
+    if (needs_rotation_) {
+      Close();
+      if (!Rotate(path, err))
+        return false;
+    }
   }
 
   log_file_ = fopen(path.c_str(), "ab");
@@ -185,6 +208,7 @@ class LineReader {
 
     line_end_ = (char*)memchr(line_start_, '\n', buf_end_ - line_start_);
     if (!line_end_) {
+
       // No newline. Move rest of data to start of buffer, fill rest.
       size_t already_consumed = line_start_ - buf_;
       size_t size_rest = (buf_end_ - buf_) - already_consumed;
@@ -213,111 +237,160 @@ class LineReader {
 
 bool BuildLog::Load(const string& path, string* err) {
   METRIC_RECORD(".ninja_log load");
-  FILE* file = fopen(path.c_str(), "r");
-  if (!file) {
-    if (errno == ENOENT)
-      return true;
-    *err = strerror(errno);
-    return false;
-  }
-
+  
   int log_version = 0;
-  int unique_entry_count = 0;
-  int total_entry_count = 0;
+  unsigned first_file_entry_count = 0;
+  unsigned total_entry_count = 0;
+  
+  for (int log_file_number=0;;++log_file_number) {
+    string actual_path = ActualLogPath(path, log_file_number);
 
-  LineReader reader(file);
-  char* line_start = 0;
-  char* line_end = 0;
-  while (reader.ReadLine(&line_start, &line_end)) {
-    if (!log_version) {
-      sscanf(line_start, kFileSignature, &log_version);
+    FILE* file = fopen(actual_path.c_str(), "r");
+    if (!file) {
+      if (errno == ENOENT)
+        break;
+      *err = strerror(errno);
+      return false;
+    }
+    max_log_file_number_ = log_file_number;
+
+    LineReader reader(file);
+    char* line_start, *line_end;
+    Log file_log;
+    while (reader.ReadLine(&line_start, &line_end)) {
+      if (!log_version)
+        sscanf(line_start, kFileSignature, &log_version);
 
       if (log_version < kOldestSupportedVersion) {
         *err = "unable to extract version from build log, perhaps due to "
           "being too old; you must clobber your build output and rebuild";
         return false;
       }
+
+      // If no newline was found in this chunk, read the next.
+      if (!line_end)
+        continue;
+
+      const char kFieldSeparator = '\t';
+
+      char* start = line_start;
+      char* end = (char*)memchr(start, kFieldSeparator, line_end - start);
+      if (!end)
+        continue;
+      *end = 0;
+
+      int start_time = 0, end_time = 0;
+      TimeStamp restat_mtime = 0;
+
+      start_time = atoi(start);
+      start = end + 1;
+
+      end = (char*)memchr(start, kFieldSeparator, line_end - start);
+      if (!end)
+        continue;
+      *end = 0;
+      end_time = atoi(start);
+      start = end + 1;
+
+      end = (char*)memchr(start, kFieldSeparator, line_end - start);
+      if (!end)
+        continue;
+      *end = 0;
+      restat_mtime = atol(start);
+      start = end + 1;
+
+      end = (char*)memchr(start, kFieldSeparator, line_end - start);
+      if (!end)
+        continue;
+      string output = string(start, end - start);
+      if (output.empty()) {
+        printf("empty output?\n");
+      }
+
+      start = end + 1;
+      end = line_end;
+
+      // Lines in a file are in temporal order, so later entries should replace
+      // earlier ones.
+      LogEntry* entry = NULL;
+      pair<Log::iterator, bool> insert_result =
+          file_log.insert(Log::value_type(output, NULL));
+      if (insert_result.second) {
+        entry = insert_result.first->second = new LogEntry;
+        entry->output.swap(output);
+      } else {
+        entry = insert_result.first->second;
+      }
+      entry->start_time = start_time;
+      entry->end_time = end_time;
+      entry->restat_mtime = restat_mtime;
+      if (log_version >= 5) {
+        char c = *end; *end = '\0';
+        entry->command_hash = (uint64_t)strtoull(start, NULL, 16);
+        *end = c;
+      } else {
+        entry->command_hash = LogEntry::HashCommand(StringPiece(start,
+                                                                end - start));
+      }
+
+      ++total_entry_count;
     }
 
-    // If no newline was found in this chunk, read the next.
-    if (!line_end)
-      continue;
+    fclose(file);
 
-    const char kFieldSeparator = '\t';
+    if (log_file_number == 0)
+      first_file_entry_count = total_entry_count;
 
-    char* start = line_start;
-    char* end = (char*)memchr(start, kFieldSeparator, line_end - start);
-    if (!end)
-      continue;
-    *end = 0;
-
-    int start_time = 0, end_time = 0;
-    TimeStamp restat_mtime = 0;
-
-    start_time = atoi(start);
-    start = end + 1;
-
-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
-    if (!end)
-      continue;
-    *end = 0;
-    end_time = atoi(start);
-    start = end + 1;
-
-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
-    if (!end)
-      continue;
-    *end = 0;
-    restat_mtime = atol(start);
-    start = end + 1;
-
-    end = (char*)memchr(start, kFieldSeparator, line_end - start);
-    if (!end)
-      continue;
-    string output = string(start, end - start);
-
-    start = end + 1;
-    end = line_end;
-
-    LogEntry* entry;
-    Log::iterator i = log_.find(output);
-    if (i != log_.end()) {
-      entry = i->second;
-    } else {
-      entry = new LogEntry;
-      entry->output = output;
-      log_.insert(Log::value_type(entry->output, entry));
-      ++unique_entry_count;
+    unsigned file_entry_count = file_log.size();
+    // But we iterate through the different log files in reverse temporal order, so
+    // entries from later files should NOT replace ones from earlier files.
+    vector<Log::iterator> to_erase;
+    for(Log::iterator i = file_log.begin();
+        i != file_log.end(); ++i) {
+      pair<Log::iterator, bool> insert_result =
+          log_.insert(Log::value_type(i->second->output, i->second));
+      if (!insert_result.second)
+        to_erase.push_back(i);
     }
-    ++total_entry_count;
-
-    entry->start_time = start_time;
-    entry->end_time = end_time;
-    entry->restat_mtime = restat_mtime;
-    if (log_version >= 5) {
-      char c = *end; *end = '\0';
-      entry->command_hash = (uint64_t)strtoull(start, NULL, 16);
-      *end = c;
-    } else {
-      entry->command_hash = LogEntry::HashCommand(StringPiece(start,
-                                                              end - start));
+    for(vector<Log::iterator>::iterator i = to_erase.begin();
+        i != to_erase.end(); ++i) {
+      LogEntry* entry = (*i)->second;
+      file_log.erase(*i);
+      delete entry;
     }
+    unsigned unique_file_entry_count = file_entry_count - to_erase.size();
+    to_erase.clear();
+
+    float kLogDropRatio = 0.25;
+    if (unique_file_entry_count < kLogDropRatio*file_entry_count) {
+      pending_log_drops_.push_front(PendingLogDrop());
+      pending_log_drops_.back().log_entries_to_save.swap(file_log);
+      pending_log_drops_.back().log_file_number = log_file_number;
+      printf("I plan to drop log file %s.\n", actual_path.c_str());
+    }
+
+    printf("Log file %s has %u total and %u unique entries.\n", actual_path.c_str(), file_entry_count, unique_file_entry_count);
   }
-  fclose(file);
 
-  if (!line_start) {
-    return true; // file was empty
+  // Time to rotate the logs?
+  unsigned kMaxEntriesPerLog = 10;
+  unsigned kMinEntriesToRotate = 1000;
+  float kRotationRatio = 0.4;
+  if (first_file_entry_count > kMaxEntriesPerLog ||
+      (first_file_entry_count > kMinEntriesToRotate &&
+       first_file_entry_count > kRotationRatio*log_.size())) {
+    needs_rotation_ = true;
   }
 
   // Decide whether it's time to rebuild the log:
   // - if we're upgrading versions
   // - if it's getting large
-  int kMinCompactionEntryCount = 100;
-  int kCompactionRatio = 3;
+  unsigned kMinCompactionEntryCount = 100;
+  unsigned kCompactionRatio = 4;
   if (log_version < kCurrentVersion) {
     needs_recompaction_ = true;
   } else if (total_entry_count > kMinCompactionEntryCount &&
-             total_entry_count > unique_entry_count * kCompactionRatio) {
+             total_entry_count > log_.size() * kCompactionRatio) {
     needs_recompaction_ = true;
   }
 
@@ -331,17 +404,99 @@ BuildLog::LogEntry* BuildLog::LookupByOutput(const string& path) {
   return NULL;
 }
 
+// static
 void BuildLog::WriteEntry(FILE* f, const LogEntry& entry) {
   fprintf(f, "%d\t%d\t%d\t%s\t%" PRIx64 "\n",
           entry.start_time, entry.end_time, entry.restat_mtime,
           entry.output.c_str(), entry.command_hash);
 }
 
+bool BuildLog::DropLogs(const string& path, string* err) {
+  for (list<PendingLogDrop>::iterator it = pending_log_drops_.begin();
+       it != pending_log_drops_.end(); ++it) {
+    string head_log_path = ActualLogPath(path, 0);
+    string drop_log_path = ActualLogPath(path, it->log_file_number);
+
+    printf("Dropping log %s, but saving %u entries.\n", drop_log_path.c_str(), static_cast<unsigned>(it->log_entries_to_save.size()));
+
+    if (it->log_entries_to_save.size() != 0 &&
+        !WriteLog(&it->log_entries_to_save, head_log_path, err, WRITELOG_APPEND))
+      return false;
+    
+    if (unlink(drop_log_path.c_str()) != 0) {
+      *err = strerror(errno);
+      return false;
+    }
+
+    for (int j = it->log_file_number;; ++j) {
+      string to_file = ActualLogPath(path, j);
+      string from_file = ActualLogPath(path, j+1);
+      if (rename(from_file.c_str(), to_file.c_str()) != 0) {
+        if (errno == ENOENT)
+          break;
+        *err = strerror(errno);
+        return false;
+      }
+    }
+    --max_log_file_number_;
+  }
+  return true;
+}
+
+
+bool BuildLog::Rotate(const string& path, string* err) {
+    printf("Rotating logs...\n");
+    printf("max log # = %d\n", max_log_file_number_);
+    for (int i = max_log_file_number_;i >= 0; --i) {
+      string from_file = ActualLogPath(path, i);
+      string to_file = ActualLogPath(path, i+1);
+      printf("rotating form %s to %s\n", from_file.c_str(), to_file.c_str());
+      if (rename(from_file.c_str(), to_file.c_str()) != 0) {
+        *err = strerror(errno);
+        return false;
+      }
+    }
+    string first_log = ActualLogPath(path, 0);
+    FILE* f = fopen(first_log.c_str(), "wb");
+    if (!f) {
+      *err = strerror(errno);
+      return false;
+    }
+    if (fprintf(f, kFileSignature, kCurrentVersion) < 0) {
+      *err = strerror(errno);
+      fclose(f);
+      return false;
+    }
+    fclose(f);
+    return true;
+}
+
 bool BuildLog::Recompact(const string& path, string* err) {
   printf("Recompacting log...\n");
-
   string temp_path = path + ".recompact";
-  FILE* f = fopen(temp_path.c_str(), "wb");
+
+  if (!WriteLog(&log_, temp_path, err, WRITELOG_TRUNCATE)) {
+    return false;
+  }
+
+  if (unlink(path.c_str()) < 0) {
+    *err = strerror(errno);
+    return false;
+  }
+
+  if (rename(temp_path.c_str(), path.c_str()) < 0) {
+    *err = strerror(errno);
+    return false;
+  }
+  return true;
+}
+
+// static
+bool BuildLog::WriteLog(Log* log, const string& path, string* err,
+                        AppendOrTruncateEnum append_or_truncate) {
+  printf("writing %u entries to %s...\n", static_cast<unsigned>(log->size()), path.c_str());
+  FILE* f = fopen(path.c_str(),
+                  append_or_truncate == WRITELOG_APPEND ? "ab" : "wb");
   if (!f) {
     *err = strerror(errno);
     return false;
@@ -353,20 +508,10 @@ bool BuildLog::Recompact(const string& path, string* err) {
     return false;
   }
 
-  for (Log::iterator i = log_.begin(); i != log_.end(); ++i) {
+  for (Log::iterator i = log->begin(); i != log->end(); ++i) {
     WriteEntry(f, *i->second);
   }
 
   fclose(f);
-  if (unlink(path.c_str()) < 0) {
-    *err = strerror(errno);
-    return false;
-  }
-
-  if (rename(temp_path.c_str(), path.c_str()) < 0) {
-    *err = strerror(errno);
-    return false;
-  }
-
   return true;
 }
